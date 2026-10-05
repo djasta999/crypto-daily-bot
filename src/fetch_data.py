@@ -54,7 +54,19 @@ def _gecko_chart_pause() -> None:
     time.sleep(1.2 if os.environ.get("COINGECKO_API_KEY", "").strip() else 8.0)
 
 
-def _get_json(url: str, params: dict[str, Any] | None = None) -> Any | None:
+def _get_json(
+    url: str,
+    params: dict[str, Any] | None = None,
+    max_429_wait: int | None = None,
+) -> Any | None:
+    """Fetch JSON from *url* with retry logic.
+
+    Args:
+        max_429_wait: If set, cap the 429 sleep to this many seconds and abort
+            immediately after the cap is exhausted (returns None).  Useful for
+            optional endpoints (e.g. market_chart) where we prefer to skip
+            rather than block the whole run.
+    """
     last_error: Exception | None = None
     headers = _coingecko_headers() if url.startswith(COINGECKO) else {}
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -65,9 +77,20 @@ def _get_json(url: str, params: dict[str, Any] | None = None) -> Any | None:
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
                     wait = max(wait, int(retry_after))
+                if max_429_wait is not None:
+                    if wait > max_429_wait:
+                        LOGGER.warning(
+                            "429 from %s — skipping (wait %ss exceeds cap %ss)",
+                            url, wait, max_429_wait,
+                        )
+                        return None
+                    wait = min(wait, max_429_wait)
                 LOGGER.warning("429 from %s — retry in %ss (attempt %s)", url, wait, attempt)
                 time.sleep(wait)
                 continue
+            if resp.status_code in (401, 403):
+                LOGGER.warning("GET %s returned %s — skipping (auth/restricted)", url, resp.status_code)
+                return None
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:  # noqa: BLE001 — skip source, never fail the whole run
@@ -140,15 +163,60 @@ def fetch_top50() -> list[dict[str, Any]]:
     return payload
 
 
+def _market_chart_blocked() -> bool:
+    """Quick probe: return True if CoinGecko market_chart is unavailable (401/403/429).
+
+    Skips Rainbow Chart and 90d fetching entirely to avoid long retry loops.
+    401/403 = endpoint restricted on keyless public API.
+    429 = IP rate-limited from previous failed requests — skip and let it cool down.
+    """
+    headers = _coingecko_headers() if _coingecko_headers() else None
+    try:
+        resp = _SESSION.get(
+            f"{COINGECKO}/coins/bitcoin/market_chart",
+            params={"vs_currency": "usd", "days": "1"},
+            timeout=DEFAULT_TIMEOUT,
+            headers=headers,
+        )
+        if resp.status_code in (401, 403):
+            LOGGER.warning(
+                "CoinGecko market_chart returned %s — Rainbow Chart skipped."
+                " Supply a valid COINGECKO_API_KEY to enable this feature.",
+                resp.status_code,
+            )
+            return True
+        if resp.status_code == 429:
+            LOGGER.warning(
+                "CoinGecko market_chart rate-limited (429) — Rainbow Chart skipped this run."
+                " Will retry automatically on the next scheduled run."
+            )
+            return True
+        return False
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("market_chart probe failed: %s", exc)
+        return False
+
+
 def fetch_btc_history() -> list[list[float]]:
+    """Fetch full BTC price history for the Rainbow Chart.
+
+    Uses max_429_wait=5 so the bot never waits more than 5 s on a rate-limited
+    market_chart request — it simply skips and returns [] (Rainbow Band = n/a).
+    """
     payload = _get_json(
         f"{COINGECKO}/coins/bitcoin/market_chart",
         params={"vs_currency": "usd", "days": "max"},
+        max_429_wait=5,
     )
     if payload and isinstance(payload.get("prices"), list) and payload["prices"]:
         return payload["prices"]
 
-    # days=max is often blocked/rate-limited on the keyless public API; stitch yearly ranges.
+    if payload is None:
+        # Endpoint blocked or rate-limited — skip gracefully.
+        LOGGER.warning("BTC history unavailable — Rainbow Chart will show n/a.")
+        return []
+
+    # days=max returned empty; stitch yearly ranges as fallback.
     LOGGER.info("Falling back to CoinGecko market_chart/range for BTC history")
     points: list[list[float]] = []
     year = 2013
@@ -165,8 +233,12 @@ def fetch_btc_history() -> list[list[float]]:
                 "from": int(start.timestamp()),
                 "to": int(end.timestamp()),
             },
+            max_429_wait=5,
         )
-        if chunk and isinstance(chunk.get("prices"), list):
+        if chunk is None:
+            LOGGER.warning("BTC history range blocked — stopping early.")
+            break
+        if isinstance(chunk.get("prices"), list):
             points.extend(chunk["prices"])
         _gecko_chart_pause()
         year += 1
@@ -201,6 +273,7 @@ def fetch_coin_chart(coin_id: str, days: int = 90) -> list[list[float]]:
     payload = _get_json(
         f"{COINGECKO}/coins/{coin_id}/market_chart",
         params={"vs_currency": "usd", "days": str(days)},
+        max_429_wait=5,
     )
     if not payload or "prices" not in payload:
         return []
@@ -213,12 +286,18 @@ def attach_90d_changes(top50: list[dict[str, Any]], btc_history: list[list[float
 
     BTC reuses the rainbow `days=max` series. Other coins get `days=90` with a short
     delay so the public rate limit is less likely to abort the whole index.
+    If btc_history is empty (market_chart blocked), skip entirely to avoid more 401s.
     """
     if not top50:
         return
     sample = top50[0]
     if sample.get("price_change_percentage_90d_in_currency") is not None:
         LOGGER.info("90d change already present on markets payload")
+        return
+
+    # If BTC history fetch was blocked, market_chart is restricted — skip all 90d fetching.
+    if not btc_history:
+        LOGGER.warning("Skipping 90d chart fetching — market_chart endpoint not available.")
         return
 
     btc_90 = pct_change_from_chart(btc_history, days=90)
