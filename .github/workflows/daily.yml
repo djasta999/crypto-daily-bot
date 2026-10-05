@@ -2,9 +2,11 @@ name: Daily crypto summary
 
 on:
   schedule:
-    # 23:00 UTC = 07:00 WITA
+    # 23:00 UTC = 07:00 WITA (fallback jika webhook eksternal tidak aktif)
     - cron: "0 23 * * *"
   workflow_dispatch:
+  repository_dispatch:
+    types: [daily_crypto]
 
 permissions:
   contents: write
